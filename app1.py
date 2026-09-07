@@ -2,1140 +2,663 @@ from flask import Flask, request, jsonify, render_template_string
 from PIL import Image
 import base64
 import io
-import random
+import math
 
 app = Flask(__name__)
 
+# ---------------------------------------------------------
+# COLOR ANALYSIS
+# ---------------------------------------------------------
 
-# =========================================================
-# AI OUTFIT ANALYZER - PYTHON
-# =========================================================
+def get_color_name(r, g, b):
+    brightness = (r + g + b) / 3
+    mx = max(r, g, b)
+    mn = min(r, g, b)
 
-def analyze_outfit(image):
+    if brightness < 45:
+        return "Black"
+    if brightness > 220 and mx - mn < 25:
+        return "White"
+    if mx - mn < 20:
+        if brightness < 110:
+            return "Dark Grey"
+        return "Grey"
 
-    # Convert image to RGB
-    image = image.convert("RGB")
+    if r > 170 and g > 150 and b < 110:
+        return "Yellow"
+    if r > 180 and g > 90 and b < 100:
+        return "Orange"
+    if r > 150 and g < 100 and b < 120:
+        return "Red"
+    if r > 150 and g < 130 and b > 130:
+        return "Pink"
+    if r > 110 and b > 100 and g < 110:
+        return "Purple"
+    if b > r * 1.15 and b > g * 1.05:
+        return "Blue"
+    if g > r * 1.12 and g > b * 1.05:
+        return "Green"
+    if r > 120 and g > 90 and b < 90:
+        return "Brown"
+    if r > 150 and g > 130 and b < 120:
+        return "Beige"
 
-    # Image size
-    width, height = image.size
+    return "Mixed Color"
 
-    # Resize for faster processing
-    small_image = image.resize((100, 100))
 
-    pixels = list(small_image.getdata())
+def analyze_colors(image):
+    img = image.convert("RGB")
+    img.thumbnail((120, 120))
 
-    # Calculate average RGB
-    total_r = 0
-    total_g = 0
-    total_b = 0
+    pixels = list(img.getdata())
 
+    # Ignore extremely bright/dark pixels when possible
+    useful = []
     for r, g, b in pixels:
-        total_r += r
-        total_g += g
-        total_b += b
+        brightness = (r + g + b) / 3
+        if 20 < brightness < 245:
+            useful.append((r, g, b))
 
-    total = len(pixels)
+    if not useful:
+        useful = pixels
 
-    avg_r = total_r // total
-    avg_g = total_g // total
-    avg_b = total_b // total
+    # Divide image into 3 horizontal areas
+    w, h = img.size
+    regions = [
+        useful,
+        list(img.crop((0, 0, w, max(1, h // 2))).getdata()),
+        list(img.crop((0, h // 2, w, h)).getdata())
+    ]
 
-    # -----------------------------------------
-    # BASIC COLOR DETECTION
-    # -----------------------------------------
+    colors = []
 
-    if avg_r > 200 and avg_g > 200 and avg_b > 200:
-        color = "White / Light"
+    for region in regions:
+        if not region:
+            continue
 
-    elif avg_r < 70 and avg_g < 70 and avg_b < 70:
-        color = "Black / Dark"
+        avg_r = sum(p[0] for p in region) / len(region)
+        avg_g = sum(p[1] for p in region) / len(region)
+        avg_b = sum(p[2] for p in region) / len(region)
 
-    elif avg_r > avg_g * 1.3 and avg_r > avg_b * 1.3:
-        color = "Red / Warm"
+        colors.append(get_color_name(avg_r, avg_g, avg_b))
 
-    elif avg_g > avg_r * 1.25 and avg_g > avg_b * 1.15:
-        color = "Green"
+    # Dominant overall color
+    avg_r = sum(p[0] for p in useful) / len(useful)
+    avg_g = sum(p[1] for p in useful) / len(useful)
+    avg_b = sum(p[2] for p in useful) / len(useful)
 
-    elif avg_b > avg_r * 1.25 and avg_b > avg_g * 1.15:
-        color = "Blue"
+    dominant = get_color_name(avg_r, avg_g, avg_b)
 
-    elif avg_r > 150 and avg_g > 100 and avg_b < 100:
-        color = "Yellow / Golden"
+    unique_colors = []
+    for c in colors:
+        if c not in unique_colors:
+            unique_colors.append(c)
+
+    if len(unique_colors) >= 2:
+        color_text = ", ".join(unique_colors[:3])
+    else:
+        color_text = dominant
+
+    return dominant, color_text, (avg_r, avg_g, avg_b)
+
+
+# ---------------------------------------------------------
+# IMAGE VISUAL FEATURES
+# ---------------------------------------------------------
+
+def visual_features(image):
+    img = image.convert("RGB")
+    img = img.resize((80, 80))
+
+    pixels = list(img.getdata())
+
+    # Brightness
+    brightness = sum((r + g + b) / 3 for r, g, b in pixels) / len(pixels)
+
+    # Color variation
+    avg_r = sum(p[0] for p in pixels) / len(pixels)
+    avg_g = sum(p[1] for p in pixels) / len(pixels)
+    avg_b = sum(p[2] for p in pixels) / len(pixels)
+
+    variation = 0
+    for r, g, b in pixels:
+        variation += abs(r - avg_r) + abs(g - avg_g) + abs(b - avg_b)
+
+    variation /= len(pixels)
+
+    # Edge/texture estimation
+    edges = 0
+
+    for y in range(1, 79):
+        for x in range(1, 79):
+            current = img.getpixel((x, y))
+            left = img.getpixel((x - 1, y))
+            up = img.getpixel((x, y - 1))
+
+            diff1 = sum(abs(current[i] - left[i]) for i in range(3))
+            diff2 = sum(abs(current[i] - up[i]) for i in range(3))
+
+            if diff1 + diff2 > 120:
+                edges += 1
+
+    texture = edges / (78 * 78)
+
+    return brightness, variation, texture
+
+
+# ---------------------------------------------------------
+# OUTFIT CLASSIFICATION
+# ---------------------------------------------------------
+
+def classify_outfit(image):
+    dominant, color_text, rgb = analyze_colors(image)
+    brightness, variation, texture = visual_features(image)
+
+    r, g, b = rgb
+
+    # These visual rules deliberately avoid random selection.
+    # They use different image characteristics to create different results.
+
+    # Bright colorful / patterned traditional-looking images
+    if variation > 55 and texture > 0.16:
+        category = "Traditional / Ethnic Outfit"
+        style = "Traditional"
+        confidence = 82
+        reason = "The image contains strong color variation and detailed visual texture."
+
+    # Darker lower-contrast outfits
+    elif brightness < 95 and variation < 48:
+        category = "Jeans / Top / Casual Outfit"
+        style = "Casual"
+        confidence = 76
+        reason = "The image has a darker, simple visual composition often seen in casual outfits."
+
+    # Light/simple outfits
+    elif brightness > 175 and variation < 42:
+        category = "Kurti / Light Casual Outfit"
+        style = "Elegant Casual"
+        confidence = 74
+        reason = "The image has a light and relatively simple color composition."
+
+    # Strong blue/dark-blue appearance
+    elif b > r * 1.12 and b > g * 1.05:
+        category = "Denim / Western Outfit"
+        style = "Western Casual"
+        confidence = 80
+        reason = "Blue tones are visually dominant in the image."
+
+    # Strong red/pink/orange appearance
+    elif r > g * 1.18 and r > b * 1.18:
+        category = "Festive / Ethnic Outfit"
+        style = "Festive"
+        confidence = 79
+        reason = "Warm red/pink tones dominate the image."
+
+    # Green dominant
+    elif g > r * 1.15 and g > b * 1.05:
+        category = "Casual / Indo-Western Outfit"
+        style = "Indo-Western"
+        confidence = 77
+        reason = "Green tones are visually prominent in the image."
 
     else:
-        color = "Mixed Colors"
+        category = "Smart Casual Outfit"
+        style = "Modern Casual"
+        confidence = 72
+        reason = "The image has a balanced color composition with moderate visual variation."
 
-    # -----------------------------------------
-    # OUTFIT CATEGORY
-    # -----------------------------------------
+    return category, style, confidence, reason, dominant, color_text
 
-    categories = [
-        "Casual Outfit",
-        "Modern Outfit",
-        "Everyday Wear",
-        "Fashion Outfit",
-        "Smart Casual"
-    ]
 
-    category = random.choice(categories)
+# ---------------------------------------------------------
+# SUGGESTIONS
+# ---------------------------------------------------------
 
-    # -----------------------------------------
-    # STYLE
-    # -----------------------------------------
+def make_suggestions(category, style, dominant):
 
-    styles = [
-        "Casual",
-        "Modern Casual",
-        "Minimal Fashion",
-        "Trendy",
-        "Smart Casual"
-    ]
+    if "Traditional" in category or "Ethnic" in category or "Festive" in category:
+        return {
+            "do": [
+                "Add small or medium traditional earrings.",
+                "Try a simple bun, braid or soft waves.",
+                "Choose juttis, ethnic sandals or traditional footwear.",
+                "Keep makeup elegant with defined eyes and a soft lip shade.",
+                "A matching dupatta or subtle traditional accessory can complete the look.",
+                "Gold or oxidised jewellery can complement the outfit.",
+                "Choose a handbag that matches the outfit instead of a very sporty bag.",
+                "Keep jewellery balanced so the outfit remains the main focus.",
+                "Use a small bindi if it matches the overall traditional look.",
+                "Choose footwear in a neutral or matching shade."
+            ],
+            "dont": [
+                "Avoid wearing too many heavy accessories together.",
+                "Avoid very sporty sneakers with a strongly traditional outfit.",
+                "Avoid mixing too many unrelated colours.",
+                "Avoid extremely heavy makeup if the outfit is already detailed.",
+                "Avoid oversized bags with a festive look."
+            ]
+        }
 
-    style = random.choice(styles)
+    if "Jeans" in category or "Western" in category or "Casual" in category:
+        return {
+            "do": [
+                "Pair jeans with clean white or neutral sneakers.",
+                "Try a simple crossbody or shoulder bag.",
+                "Soft waves, ponytail or open hair can work well.",
+                "Use light natural makeup for a casual appearance.",
+                "A watch or minimal bracelet can add a polished touch.",
+                "Try a denim jacket or light layer when appropriate.",
+                "Keep accessories minimal and modern.",
+                "Choose footwear that matches the casual vibe.",
+                "Neutral sneakers work well with many denim looks.",
+                "A simple chain or small earrings can complete the outfit."
+            ],
+            "dont": [
+                "Avoid too many heavy accessories.",
+                "Avoid formal jewellery with a very sporty outfit.",
+                "Avoid combining too many bold patterns.",
+                "Avoid uncomfortable footwear for a casual outfit.",
+                "Avoid an oversized bag if the outfit is already loose."
+            ]
+        }
 
-    # -----------------------------------------
-    # OUTFIT SCORE
-    # -----------------------------------------
+    if "Kurti" in category or "Indo-Western" in category:
+        return {
+            "do": [
+                "Try small jhumkas or simple earrings.",
+                "Pair the kurti with comfortable sandals or juttis.",
+                "A straight hairstyle, braid or soft waves can work well.",
+                "Use light makeup with a natural lip colour.",
+                "A matching dupatta can enhance the outfit.",
+                "Choose a small ethnic or neutral handbag.",
+                "A simple bracelet or watch can add a neat finish.",
+                "Keep the colour combination balanced.",
+                "Choose footwear that complements the kurti colour.",
+                "For a modern look, add minimal accessories."
+            ],
+            "dont": [
+                "Avoid very heavy jewellery with a simple kurti.",
+                "Avoid mixing too many bright colours.",
+                "Avoid overly sporty footwear with a formal ethnic kurti.",
+                "Avoid excessive makeup for a simple daytime look.",
+                "Avoid accessories that hide the neckline or design."
+            ]
+        }
 
-    score = random.randint(78, 96)
+    return {
+        "do": [
+            "Use minimal accessories for a clean appearance.",
+            "Choose footwear that matches the outfit style.",
+            "Try a neat ponytail, open hair or soft waves.",
+            "Use natural makeup for a balanced look.",
+            "Choose a handbag in a matching or neutral shade.",
+            "Add a simple watch or bracelet.",
+            "Keep the colour combination coordinated.",
+            "Choose comfortable footwear for everyday wear.",
+            "Use one statement accessory instead of many.",
+            "Keep the overall look clean and balanced."
+        ],
+        "dont": [
+            "Avoid mixing too many colours.",
+            "Avoid too many statement accessories together.",
+            "Avoid footwear that clashes with the outfit style.",
+            "Avoid very heavy makeup for a simple outfit.",
+            "Avoid oversized accessories if the outfit is already detailed."
+        ]
+    }
 
-    # -----------------------------------------
-    # STYLE SUGGESTION
-    # -----------------------------------------
 
-    suggestions = [
-        "Try white sneakers with this outfit.",
-        "Minimal accessories can make this outfit look more elegant.",
-        "A simple handbag can complement this outfit nicely.",
-        "Neutral-colored shoes would match this outfit well.",
-        "Try adding a light jacket for a stylish appearance.",
-        "Small earrings and a simple watch can enhance the look.",
-        "Try matching the outfit with simple accessories."
-    ]
+# ---------------------------------------------------------
+# ANALYZE IMAGE
+# ---------------------------------------------------------
 
-    suggestion = random.choice(suggestions)
+def analyze_outfit(image):
+    category, style, confidence, reason, dominant, color_text = classify_outfit(image)
+
+    suggestions = make_suggestions(category, style, dominant)
 
     return {
         "category": category,
-        "color": color,
+        "dominant_color": dominant,
+        "color": color_text,
         "style": style,
-        "score": score,
-        "suggestion": suggestion,
-        "width": width,
-        "height": height
+        "score": confidence,
+        "reason": reason,
+        "do": suggestions["do"],
+        "dont": suggestions["dont"]
     }
 
 
-# =========================================================
-# HTML + CSS + JAVASCRIPT
-# =========================================================
+# ---------------------------------------------------------
+# WEB PAGE
+# ---------------------------------------------------------
 
 HTML = """
-
 <!DOCTYPE html>
-
 <html>
-
 <head>
-
-<meta charset="UTF-8">
-
-<meta name="viewport"
-content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 
 <title>AI Outfit Analyzer</title>
 
-
 <style>
-
-/* =========================
-   GENERAL
-========================= */
 
 * {
     box-sizing: border-box;
-    margin: 0;
-    padding: 0;
 }
 
 body {
-
+    margin: 0;
     font-family: Arial, sans-serif;
-
-    min-height: 100vh;
-
-    background:
-    linear-gradient(
-        135deg,
-        #f6f0ff,
-        #fff1f7,
-        #eef7ff
-    );
-
-    color: #333;
+    background: linear-gradient(135deg, #f8f4ff, #fff8f0);
+    color: #29233d;
 }
-
-
-/* =========================
-   MAIN CONTAINER
-========================= */
 
 .container {
-
-    width: 90%;
-
-    max-width: 1100px;
-
+    max-width: 900px;
     margin: auto;
-
+    padding: 25px;
 }
 
-
-/* =========================
-   HEADER
-========================= */
-
-header {
-
+.header {
     text-align: center;
-
-    padding: 40px 10px 25px;
-
+    margin-bottom: 25px;
 }
 
-.logo {
-
-    font-size: 34px;
-
-    font-weight: bold;
-
-    margin-bottom: 10px;
-
-}
-
-header p {
-
-    color: #777;
-
-    font-size: 16px;
-
-}
-
-
-/* =========================
-   MAIN CARD
-========================= */
-
-.main-card {
-
-    background: white;
-
-    padding: 40px;
-
-    border-radius: 25px;
-
-    box-shadow:
-    0 15px 45px
-    rgba(0,0,0,0.10);
-
-    margin-bottom: 30px;
-
-}
-
-
-/* =========================
-   TITLE
-========================= */
-
-.title {
-
-    text-align: center;
-
-    margin-bottom: 10px;
-
-    font-size: 30px;
-
-}
-
-.subtitle {
-
-    text-align: center;
-
-    color: #777;
-
-    margin-bottom: 30px;
-
-}
-
-
-/* =========================
-   UPLOAD AREA
-========================= */
-
-.upload-area {
-
-    border: 2px dashed #aaa;
-
-    border-radius: 20px;
-
-    padding: 45px 20px;
-
-    text-align: center;
-
-    transition: 0.3s;
-
-}
-
-.upload-area:hover {
-
-    transform: translateY(-3px);
-
-    box-shadow:
-    0 10px 25px
-    rgba(0,0,0,0.08);
-
-}
-
-.upload-icon {
-
-    font-size: 65px;
-
-    margin-bottom: 15px;
-
-}
-
-.upload-area h2 {
-
+.header h1 {
+    font-size: 38px;
     margin-bottom: 8px;
-
 }
 
-.upload-area p {
+.header p {
+    color: #6d667d;
+}
 
-    color: #888;
-
+.card {
+    background: white;
+    border-radius: 22px;
+    padding: 25px;
+    box-shadow: 0 10px 35px rgba(0,0,0,0.08);
     margin-bottom: 20px;
-
 }
 
-
-/* =========================
-   FILE INPUT
-========================= */
-
-input[type="file"] {
-
-    margin-bottom: 20px;
-
+.upload {
+    border: 2px dashed #b9a9d8;
+    border-radius: 18px;
+    padding: 35px;
+    text-align: center;
+    cursor: pointer;
 }
 
-
-/* =========================
-   BUTTON
-========================= */
+.upload input {
+    margin-top: 15px;
+}
 
 button {
-
-    display: block;
-
-    margin: auto;
-
-    padding: 14px 32px;
-
     border: none;
-
-    border-radius: 30px;
-
-    background: #333;
-
-    color: white;
-
+    border-radius: 12px;
+    padding: 14px 25px;
     font-size: 16px;
-
-    font-weight: bold;
-
     cursor: pointer;
-
-    transition: 0.3s;
-
+    margin-top: 15px;
 }
-
-button:hover {
-
-    transform: translateY(-3px);
-
-    box-shadow:
-    0 8px 20px
-    rgba(0,0,0,0.20);
-
-}
-
-
-/* =========================
-   LOADING
-========================= */
-
-#loading {
-
-    display: none;
-
-    text-align: center;
-
-    margin-top: 25px;
-
-    font-weight: bold;
-
-}
-
-
-/* =========================
-   RESULT
-========================= */
-
-#result {
-
-    display: none;
-
-    background: white;
-
-    padding: 35px;
-
-    border-radius: 25px;
-
-    box-shadow:
-    0 15px 45px
-    rgba(0,0,0,0.10);
-
-    margin-bottom: 30px;
-
-}
-
-.result-title {
-
-    text-align: center;
-
-    font-size: 28px;
-
-    margin-bottom: 30px;
-
-}
-
-
-/* =========================
-   RESULT GRID
-========================= */
-
-.result-grid {
-
-    display: grid;
-
-    grid-template-columns:
-    1fr 1fr;
-
-    gap: 30px;
-
-}
-
-
-/* =========================
-   IMAGE
-========================= */
 
 .preview {
+    max-width: 300px;
+    max-height: 350px;
+    display: none;
+    margin: 20px auto;
+    border-radius: 18px;
+}
 
+.loading {
+    display: none;
     text-align: center;
-
+    padding: 15px;
 }
 
-.preview img {
-
-    width: 100%;
-
-    max-width: 420px;
-
-    max-height: 500px;
-
-    object-fit: cover;
-
-    border-radius: 20px;
-
+.result {
+    display: none;
 }
 
-
-/* =========================
-   ANALYSIS
-========================= */
-
-.analysis {
-
-    display: flex;
-
-    flex-direction: column;
-
+.grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
     gap: 15px;
-
 }
 
-.result-item {
-
-    background: #f7f7f7;
-
-    padding: 18px;
-
+.box {
+    background: #faf8ff;
     border-radius: 15px;
-
-    display: flex;
-
-    justify-content:
-    space-between;
-
-    align-items: center;
-
+    padding: 18px;
 }
 
-.result-item span {
-
-    font-weight: bold;
-
+.box h3 {
+    margin-top: 0;
 }
 
-.result-item strong {
-
-    text-align: right;
-
+ul {
+    padding-left: 22px;
 }
 
-
-/* =========================
-   SCORE
-========================= */
-
-.score-card {
-
-    text-align: center;
-
-    padding: 20px;
-
-    background: #f4f4f4;
-
-    border-radius: 20px;
-
+li {
+    margin-bottom: 9px;
 }
 
-.score {
+@media(max-width:650px) {
+    .grid {
+        grid-template-columns: 1fr;
+    }
 
-    font-size: 55px;
-
-    font-weight: bold;
-
-    margin: 8px;
-
-}
-
-
-/* =========================
-   SUGGESTION
-========================= */
-
-.suggestion {
-
-    padding: 20px;
-
-    border-radius: 20px;
-
-    background: #fafafa;
-
-}
-
-.suggestion h3 {
-
-    margin-bottom: 10px;
-
-}
-
-.suggestion p {
-
-    color: #666;
-
-    line-height: 1.5;
-
-}
-
-
-/* =========================
-   FOOTER
-========================= */
-
-footer {
-
-    text-align: center;
-
-    padding: 20px;
-
-    color: #777;
-
-    margin-bottom: 20px;
-
-}
-
-
-/* =========================
-   MOBILE
-========================= */
-
-@media(max-width: 768px) {
+    .header h1 {
+        font-size: 30px;
+    }
 
     .container {
-
-        width: 94%;
-
+        padding: 15px;
     }
-
-    .main-card {
-
-        padding: 25px 18px;
-
-    }
-
-    .title {
-
-        font-size: 24px;
-
-    }
-
-    .logo {
-
-        font-size: 27px;
-
-    }
-
-    .result-grid {
-
-        grid-template-columns: 1fr;
-
-    }
-
 }
 
 </style>
-
 </head>
-
 
 <body>
 
-
 <div class="container">
 
+<div class="header">
+<h1>✨ AI Outfit Analyzer</h1>
+<p>Upload your outfit photo and get personalized style suggestions.</p>
+</div>
 
-<header>
+<div class="card">
 
-<div class="logo">
+<div class="upload">
+<strong>📸 Upload Outfit Image</strong>
+<br>
+<input type="file" id="imageInput" accept="image/*">
+</div>
 
-👗 AI Outfit Analyzer
+<img id="preview" class="preview">
+
+<button onclick="analyze()">Analyze Outfit</button>
+
+<div id="loading" class="loading">
+⏳ Analyzing your outfit...
+</div>
 
 </div>
 
-<p>
+<div id="result" class="result">
 
-Smart Fashion Analysis using Python
+<div class="card">
 
-</p>
+<h2>✨ Analysis Result</h2>
 
-</header>
+<div class="grid">
 
+<div class="box">
+<h3>👗 Category</h3>
+<p id="category"></p>
+</div>
 
+<div class="box">
+<h3>🎨 Dominant Color</h3>
+<p id="color"></p>
+</div>
 
-<div class="main-card">
+<div class="box">
+<h3>✨ Style</h3>
+<p id="style"></p>
+</div>
 
-
-<h1 class="title">
-
-Discover Your Outfit Style ✨
-
-</h1>
-
-
-<p class="subtitle">
-
-Upload your outfit image and let AI analyze your fashion style.
-
-</p>
-
-
-
-<div class="upload-area">
-
-
-<div class="upload-icon">
-
-📸
+<div class="box">
+<h3>⭐ Style Score</h3>
+<p id="score"></p>
+</div>
 
 </div>
 
-
-<h2>
-
-Upload Your Outfit
-
-</h2>
-
-
-<p>
-
-Select a JPG, JPEG or PNG image
-
-</p>
-
-
-<input
-
-type="file"
-
-id="imageInput"
-
-accept="image/*"
-
-
->
-
-
-<button
-
-onclick="analyzeImage()">
-
-🔍 Analyze Outfit
-
-</button>
-
+<p><strong>🔎 Why this result?</strong></p>
+<p id="reason"></p>
 
 </div>
 
+<div class="card">
 
-<div id="loading">
-
-🤖 AI is analyzing your outfit...
-
-</div>
-
+<h2>💖 What You Should Do</h2>
+<ul id="doList"></ul>
 
 </div>
 
+<div class="card">
 
-
-<div id="result">
-
-
-<h2 class="result-title">
-
-✨ AI Analysis Result
-
-</h2>
-
-
-
-<div class="result-grid">
-
-
-<div class="preview">
-
-<img
-
-id="previewImage"
-
-src=""
-
-alt="Outfit Preview"
-
->
-
-</div>
-
-
-
-<div class="analysis">
-
-
-<div class="result-item">
-
-<span>
-
-👕 Category
-
-</span>
-
-<strong id="category">
-
--
-
-</strong>
-
-</div>
-
-
-
-<div class="result-item">
-
-<span>
-
-🎨 Main Color
-
-</span>
-
-<strong id="color">
-
--
-
-</strong>
-
-</div>
-
-
-
-<div class="result-item">
-
-<span>
-
-👗 Style
-
-</span>
-
-<strong id="style">
-
--
-
-</strong>
-
-</div>
-
-
-
-<div class="score-card">
-
-<div>
-
-⭐ Outfit Score
-
-</div>
-
-
-<div class="score"
-
-id="score">
-
-0
-
-</div>
-
-
-<div>
-
-out of 100
+<h2>⚠️ What You Should Avoid</h2>
+<ul id="dontList"></ul>
 
 </div>
 
 </div>
 
-
-
-<div class="suggestion">
-
-
-<h3>
-
-💡 AI Style Suggestion
-
-</h3>
-
-
-<p id="suggestion">
-
--
-
-</p>
-
-
 </div>
-
-
-</div>
-
-
-</div>
-
-
-</div>
-
-
-
-<footer>
-
-🤖 AI Outfit Analyzer |
-
-HTML • CSS • JavaScript • Python
-
-</footer>
-
-
-</div>
-
-
 
 <script>
 
+let selectedImage = null;
 
-// ========================================
-// JAVASCRIPT
-// ========================================
+document.getElementById("imageInput").addEventListener("change", function(e) {
 
-async function analyzeImage() {
+    selectedImage = e.target.files[0];
 
+    if (!selectedImage) return;
 
-    const input =
-        document.getElementById("imageInput");
+    const preview = document.getElementById("preview");
 
-
-    const loading =
-        document.getElementById("loading");
-
-
-    const result =
-        document.getElementById("result");
+    preview.src = URL.createObjectURL(selectedImage);
+    preview.style.display = "block";
+});
 
 
-    const preview =
-        document.getElementById("previewImage");
+async function analyze() {
 
-
-    // Check image
-
-    if (input.files.length === 0) {
-
-        alert(
-            "Please select an outfit image first!"
-        );
-
+    if (!selectedImage) {
+        alert("Please upload an outfit image first.");
         return;
-
     }
 
+    const loading = document.getElementById("loading");
+    const result = document.getElementById("result");
 
-    const file =
-        input.files[0];
+    loading.style.display = "block";
+    result.style.display = "none";
 
-
-    // Show image immediately
-
-    const reader =
-        new FileReader();
-
-
-    reader.onload =
-        function(event) {
-
-            preview.src =
-                event.target.result;
-
-        };
-
-
-    reader.readAsDataURL(file);
-
-
-    // Create FormData
-
-    const formData =
-        new FormData();
-
-
-    formData.append(
-        "image",
-        file
-    );
-
-
-    // Loading
-
-    loading.style.display =
-        "block";
-
-
-    result.style.display =
-        "none";
-
+    const formData = new FormData();
+    formData.append("image", selectedImage);
 
     try {
 
-
-        const response =
-            await fetch(
-                "/analyze",
-                {
-                    method: "POST",
-                    body: formData
-                }
-            );
-
-
-        const data =
-            await response.json();
-
-
-        if (data.error) {
-
-            alert(data.error);
-
-            return;
-
-        }
-
-
-        // Display results
-
-        document.getElementById(
-            "category"
-        ).textContent =
-            data.category;
-
-
-        document.getElementById(
-            "color"
-        ).textContent =
-            data.color;
-
-
-        document.getElementById(
-            "style"
-        ).textContent =
-            data.style;
-
-
-        document.getElementById(
-            "score"
-        ).textContent =
-            data.score;
-
-
-        document.getElementById(
-            "suggestion"
-        ).textContent =
-            data.suggestion;
-
-
-        // Show result
-
-        result.style.display =
-            "block";
-
-
-        result.scrollIntoView({
-            behavior: "smooth"
+        const response = await fetch("/analyze", {
+            method: "POST",
+            body: formData
         });
 
+        const data = await response.json();
+
+        document.getElementById("category").innerText = data.category;
+        document.getElementById("color").innerText =
+            data.dominant_color + " (" + data.color + ")";
+
+        document.getElementById("style").innerText = data.style;
+        document.getElementById("score").innerText = data.score + "/100";
+        document.getElementById("reason").innerText = data.reason;
+
+        const doList = document.getElementById("doList");
+        const dontList = document.getElementById("dontList");
+
+        doList.innerHTML = "";
+        dontList.innerHTML = "";
+
+        data.do.forEach(function(item) {
+            const li = document.createElement("li");
+            li.innerText = item;
+            doList.appendChild(li);
+        });
+
+        data.dont.forEach(function(item) {
+            const li = document.createElement("li");
+            li.innerText = item;
+            dontList.appendChild(li);
+        });
+
+        result.style.display = "block";
+
+    } catch (error) {
+
+        alert("Unable to analyze image. Please try again.");
+
+    } finally {
+
+        loading.style.display = "none";
 
     }
-
-
-    catch(error) {
-
-
-        console.log(error);
-
-
-        alert(
-            "Something went wrong. Please try again."
-        );
-
-
-    }
-
-
-    finally {
-
-        loading.style.display =
-            "none";
-
-    }
-
 }
 
 </script>
 
-
 </body>
-
 </html>
-
 """
 
 
-# =========================================================
-# HOME PAGE
-# =========================================================
+# ---------------------------------------------------------
+# ROUTES
+# ---------------------------------------------------------
 
 @app.route("/")
 def home():
-
     return render_template_string(HTML)
 
-
-# =========================================================
-# ANALYZE IMAGE
-# =========================================================
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
 
     if "image" not in request.files:
-
-        return jsonify({
-            "error": "No image uploaded"
-        })
-
+        return jsonify({"error": "No image uploaded"}), 400
 
     file = request.files["image"]
 
-
-    if file.filename == "":
-
-        return jsonify({
-            "error": "Please select an image"
-        })
-
-
     try:
-
-        image = Image.open(file)
-
+        image = Image.open(file.stream)
         result = analyze_outfit(image)
-
         return jsonify(result)
 
-
     except Exception as e:
-
-        return jsonify({
-            "error": str(e)
-        })
+        return jsonify({"error": str(e)}), 500
 
 
-# =========================================================
-# RUN APPLICATION
-# =========================================================
+# ---------------------------------------------------------
+# LOCAL RUN
+# ---------------------------------------------------------
 
 if __name__ == "__main__":
-
-    print("")
-    print("======================================")
-    print("      AI OUTFIT ANALYZER")
-    print("======================================")
-    print("")
-    print("Open this link in your browser:")
-    print("http://127.0.0.1:5000")
-    print("")
-
-    app.run(
-        debug=True,
-        host="127.0.0.1",
-        port=5000
-    )
+    app.run(debug=True, host="127.0.0.1", port=5000)
